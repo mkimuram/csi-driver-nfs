@@ -261,17 +261,19 @@ sanity_enabled () {
     [ "${CSI_PROW_TESTS_SANITY}" = "sanity" ] && tests_enabled "sanity"
 }
 tests_need_kind () {
-    tests_enabled "parallel" "serial" "serial-alpha" "parallel-alpha" ||
+    tests_enabled "parallel" "serial" "serial-alpha" "parallel-alpha" "custom-serial" "custom-parallel" ||
         sanity_enabled
 }
 tests_need_non_alpha_cluster () {
-    tests_enabled "parallel" "serial" ||
+    tests_enabled "parallel" "serial" "custom-serial" "custom-parallel" ||
         sanity_enabled
 }
 tests_need_alpha_cluster () {
     tests_enabled "parallel-alpha" "serial-alpha"
 }
-
+tests_custom_csi_driver () {
+    tests_enabled "custom-serial" "custom-parallel"
+}
 
 # Serial vs. parallel is always determined by these regular expressions.
 # Individual regular expressions are seperated by spaces for readability
@@ -655,6 +657,18 @@ install_hostpath () {
     fi
 }
 
+deploy_custom_csi_driver () {
+    if [ -e "${CSI_PROW_WORK}/deploy" ]; then
+        return
+    fi
+
+    git_checkout "https://github.com/kubernetes-csi/${REPO_NAME}" "${GOPATH}/src/github.com/kubernetes-csi/${REPO_NAME}" "${PULL_REFS}" --depth=1 || die "checking out ${REPO_NAME} repo failed"
+    mkdir -p "${CSI_PROW_WORK}/deploy"
+
+    cp "${GOPATH}/src/github.com/kubernetes-csi/${REPO_NAME}/deploy/kubernetes/*" "${CSI_PROW_WORK}/deploy"
+    kubectl create -f "${CSI_PROW_WORK}/deploy"
+}
+
 # collect logs and cluster status (like the version of all components, Kubernetes version, test version)
 collect_cluster_info () {
     cat <<EOF
@@ -710,6 +724,18 @@ install_e2e () {
     else
         run_with_go "${CSI_PROW_GO_VERSION_E2E}" go test -c -o "${CSI_PROW_WORK}/e2e.test" "${CSI_PROW_E2E_IMPORT_PATH}/test/e2e"
     fi
+}
+
+# Makes the E2E test suite binary available as "${CSI_PROW_WORK}/tests".
+install_custom_e2e () {
+    if [ -e "${CSI_PROW_WORK}/tests" ]; then
+        return
+    fi
+
+    git_checkout "https://github.com/kubernetes-csi/${REPO_NAME}" "${GOPATH}/src/github.com/kubernetes-csi/${REPO_NAME}" "${PULL_REFS}" --depth=1 || die "checking out ${REPO_NAME} repo failed"
+    cd "${GOPATH}/src/github.com/kubernetes-csi/${REPO_NAME}" && make build-tests
+    ln -s "${GOPATH}/src/github.com/kubernetes-csi/${REPO_NAME}/bin/tests" "${CSI_PROW_WORK}"
+
 }
 
 # Makes the csi-sanity test suite binary available as
@@ -803,6 +829,28 @@ run_e2e () (
 
     cd "${GOPATH}/src/${CSI_PROW_E2E_IMPORT_PATH}" &&
     run_with_loggers ginkgo -v "$@" "${CSI_PROW_WORK}/e2e.test" -- -report-dir "${ARTIFACTS}" -storage.testdriver="${CSI_PROW_WORK}/test-driver.yaml"
+)
+
+# Runs the E2E test suite in a sub-shell.
+run_custom_e2e () (
+    name="$1"
+    shift
+
+    install_custom_e2e || die "building custom e2e test failed"
+    install_ginkgo || die "installing ginkgo failed"
+
+    # Rename, merge and filter JUnit files. Necessary in case that we run the E2E suite again
+    # and to avoid the large number of "skipped" tests that we get from using
+    # the full Kubernetes E2E testsuite while only running a few tests.
+    move_junit () {
+        if ls "${ARTIFACTS}"/junit_[0-9]*.xml 2>/dev/null >/dev/null; then
+            run_filter_junit -t="External Storage" -o "${ARTIFACTS}/junit_${name}.xml" "${ARTIFACTS}"/junit_[0-9]*.xml && rm -f "${ARTIFACTS}"/junit_[0-9]*.xml
+        fi
+    }
+    trap move_junit EXIT
+
+    cd "${GOPATH}/src/${CSI_PROW_E2E_IMPORT_PATH}" &&
+    run_with_loggers "${CSI_PROW_WORK}/tests" --ginkgo.v -- -report-dir "${ARTIFACTS}"
 )
 
 # Run csi-sanity against installed CSI driver.
@@ -1025,6 +1073,30 @@ main () {
                          -focus="External.Storage.*($(regex_join "${CSI_PROW_E2E_SERIAL}"))" \
                          -skip="$(regex_join "${CSI_PROW_E2E_ALPHA}" "${CSI_PROW_E2E_SKIP}")"; then
                         warn "E2E serial failed"
+                        ret=1
+                    fi
+                fi
+            fi
+
+            if need_custom_csi_driver && deploy_custom_csi_driver; then
+                collect_cluster_info
+
+                if tests_enabled "custom-parallel"; then
+                    # Ignore: Double quote to prevent globbing and word splitting.
+                    # shellcheck disable=SC2086
+                    if ! run_custom_e2e custom-parallel ${CSI_PROW_GINKO_PARALLEL} \
+                         -focus="\[sig-storage\] CSI Volumes" \
+                         -skip="$(regex_join "${CSI_PROW_E2E_SERIAL}" "${CSI_PROW_E2E_ALPHA}" "${CSI_PROW_E2E_SKIP}")"; then
+                        warn "E2E custom parallel failed"
+                        ret=1
+                    fi
+                fi
+
+                if tests_enabled "custom-serial"; then
+                    if ! run_custom_e2e custom-serial \
+                         -focus="\[sig-storage\] CSI Volumes.*($(regex_join "${CSI_PROW_E2E_SERIAL}"))" \
+                         -skip="$(regex_join "${CSI_PROW_E2E_ALPHA}" "${CSI_PROW_E2E_SKIP}")"; then
+                        warn "E2E custom serial failed"
                         ret=1
                     fi
                 fi
