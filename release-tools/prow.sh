@@ -261,18 +261,18 @@ sanity_enabled () {
     [ "${CSI_PROW_TESTS_SANITY}" = "sanity" ] && tests_enabled "sanity"
 }
 tests_need_kind () {
-    tests_enabled "parallel" "serial" "serial-alpha" "parallel-alpha" "custom-serial" "custom-parallel" ||
+    tests_enabled "parallel" "serial" "serial-alpha" "parallel-alpha" "repo-custom-serial" "repo-custom-parallel" ||
         sanity_enabled
 }
 tests_need_non_alpha_cluster () {
-    tests_enabled "parallel" "serial" "custom-serial" "custom-parallel" ||
+    tests_enabled "parallel" "serial" ||
         sanity_enabled
+}
+tests_need_non_alpha_cluster_for_repo_driver () {
+    tests_enabled "repo-custom-serial" "repo-custom-parallel"
 }
 tests_need_alpha_cluster () {
     tests_enabled "parallel-alpha" "serial-alpha"
-}
-tests_custom_csi_driver () {
-    tests_enabled "custom-serial" "custom-parallel"
 }
 
 # Serial vs. parallel is always determined by these regular expressions.
@@ -657,16 +657,48 @@ install_hostpath () {
     fi
 }
 
-deploy_custom_csi_driver () {
+deploy_repo_csi_driver () {
     if [ -e "${CSI_PROW_WORK}/deploy" ]; then
         return
     fi
 
-    git_checkout "https://github.com/kubernetes-csi/${REPO_NAME}" "${GOPATH}/src/github.com/kubernetes-csi/${REPO_NAME}" "${PULL_REFS}" --depth=1 || die "checking out ${REPO_NAME} repo failed"
-    mkdir -p "${CSI_PROW_WORK}/deploy"
+    git_checkout "https://github.com/${REPO_OWNER}/${REPO_NAME}" "${CSI_PROW_WORK}/${REPO_NAME}" "${PULL_REFS}" --depth=1 || die "checking out ${REPO_NAME} repo failed"
 
-    cp "${GOPATH}/src/github.com/kubernetes-csi/${REPO_NAME}/deploy/kubernetes/*" "${CSI_PROW_WORK}/deploy"
-    kubectl create -f "${CSI_PROW_WORK}/deploy"
+    # Build container images if CSI_PROW_BUILD_JOB is true
+    if ${CSI_PROW_BUILD_JOB}; then
+        cd ${CSI_PROW_WORK}/${REPO_NAME}
+        # Build container images
+        make container | die "could not build image"
+
+        # Ignore: Double quote to prevent globbing and word splitting.
+        # Ignore: To read lines rather than words, pipe/redirect to a 'while read' loop.
+        # shellcheck disable=SC2086 disable=SC2013
+        for i in $(grep '^\s*CMDS\s*=' Makefile | sed -e 's/\s*CMDS\s*=//'); do
+            # Add csiprow tag to the latest images
+            docker tag "$i:latest" "$i:csiprow" || die "tagging the locally built container image for $i failed"
+            # Load image into kind
+            kind load docker-image --name csi-prow $i:csiprow || die "could not load the $i:csiprow image into the kind cluster"
+        done
+        cd ../..
+    fi
+
+    # Deploy container
+    # Copy all yaml files under deploy directory
+    cp -r "${CSI_PROW_WORK}/${REPO_NAME}/deploy/kubernetes/" "${CSI_PROW_WORK}/deploy/"
+
+    # Change tags of the images to csiprow to use the built images if CSI_PROW_BUILD_JOB is true
+    if ${CSI_PROW_BUILD_JOB}; then
+
+        # Ignore: Double quote to prevent globbing and word splitting.
+        # Ignore: To read lines rather than words, pipe/redirect to a 'while read' loop.
+        # shellcheck disable=SC2086 disable=SC2013
+        for i in $(grep '^\s*CMDS\s*=' ${CSI_PROW_WORK}/${REPO_NAME}/Makefile | sed -e 's/\s*CMDS\s*=//'); do
+            # Replace tags from latest to csiprow
+            find ${CSI_PROW_WORK}/deploy/ -name "*.yaml" | xargs sed -i 's/image: .*'"$i"':.*$/image: '"$i"':csiprow/g' 
+        done
+    fi
+    # Create all resources in yaml files
+    kubectl create -f "${CSI_PROW_WORK}/deploy/"
 }
 
 # collect logs and cluster status (like the version of all components, Kubernetes version, test version)
@@ -732,9 +764,9 @@ install_custom_e2e () {
         return
     fi
 
-    git_checkout "https://github.com/kubernetes-csi/${REPO_NAME}" "${GOPATH}/src/github.com/kubernetes-csi/${REPO_NAME}" "${PULL_REFS}" --depth=1 || die "checking out ${REPO_NAME} repo failed"
-    cd "${GOPATH}/src/github.com/kubernetes-csi/${REPO_NAME}" && make build-tests
-    ln -s "${GOPATH}/src/github.com/kubernetes-csi/${REPO_NAME}/bin/tests" "${CSI_PROW_WORK}"
+    git_checkout "https://github.com/${REPO_OWNER}/${REPO_NAME}" "${GOPATH}/src/github.com/${REPO_OWNER}/${REPO_NAME}" "${PULL_REFS}" --depth=1 || die "checking out ${REPO_NAME} repo failed"
+    cd "${GOPATH}/src/github.com/${REPO_OWNER}/${REPO_NAME}" && make build-tests
+    ln -s "${GOPATH}/src/github.com/${REPO_OWNER}/${REPO_NAME}/bin/tests" "${CSI_PROW_WORK}"
 
 }
 
@@ -1077,11 +1109,15 @@ main () {
                     fi
                 fi
             fi
+        fi
 
-            if need_custom_csi_driver && deploy_custom_csi_driver; then
+        if tests_need_non_alpha_cluster_for_repo_driver; then
+            start_cluster || die "starting the non-alpha cluster failed"
+
+            if deploy_repo_csi_driver; then
                 collect_cluster_info
 
-                if tests_enabled "custom-parallel"; then
+                if tests_enabled "repo-custom-parallel"; then
                     # Ignore: Double quote to prevent globbing and word splitting.
                     # shellcheck disable=SC2086
                     if ! run_custom_e2e custom-parallel ${CSI_PROW_GINKO_PARALLEL} \
@@ -1092,7 +1128,7 @@ main () {
                     fi
                 fi
 
-                if tests_enabled "custom-serial"; then
+                if tests_enabled "repo-custom-serial"; then
                     if ! run_custom_e2e custom-serial \
                          -focus="\[sig-storage\] CSI Volumes.*($(regex_join "${CSI_PROW_E2E_SERIAL}"))" \
                          -skip="$(regex_join "${CSI_PROW_E2E_ALPHA}" "${CSI_PROW_E2E_SKIP}")"; then
